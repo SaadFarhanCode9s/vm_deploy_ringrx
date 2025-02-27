@@ -1,0 +1,13 @@
+worker_app: synapse.app.generic_worker
+worker_name: matrix-synapse-worker-<%= @worker_name %>
+
+worker_daemonize: false
+worker_log_config: /etc/matrix-synapse/log.yaml
+
+worker_listeners:
+  - type: http
+    bind_addresses: ['<%= node['rxsynapse_attributes']['ipaddress'] %>'] # Node IP
+    x_forwarded: true
+    port: @worker_port
+    resources:
+      - names: ["client"]

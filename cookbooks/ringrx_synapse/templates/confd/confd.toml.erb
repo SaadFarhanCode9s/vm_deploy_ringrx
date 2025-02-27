@@ -1,0 +1,8 @@
+backend = "etcdv3"
+interval = 10
+watch = true
+nodes=[
+<% node['rxsynapse_attributes']['servers'].each do |server| %>
+    "http://<%=server['ipaddress']%>:<%=node['rxsynapse_attributes']['etcd']['host_port']%>",
+<% end %>
+]

@@ -1,0 +1,61 @@
+#!/bin/bash
+set -e
+
+DB_NAME=<%= node['rxsynapse_attributes']['pgsql']['db_name'] %>
+DB_USER=<%= node['rxsynapse_attributes']['pgsql']['db_user'] %>
+DB_USER_PASS=<%= node['rxsynapse_attributes']['pgsql']['db_password'] %>
+
+REPLICATOR_USERNAME=<%= node['rxsynapse_attributes']['pgsql']['replicator_username'] %>
+REPLICATOR_PASS=<%= node['rxsynapse_attributes']['pgsql']['replicator_password'] %>
+
+SUPER_USERNAME=<%= node['rxsynapse_attributes']['pgsql']['superuser_username'] %>
+SUPER_PASS=<%= node['rxsynapse_attributes']['pgsql']['superuser_password'] %>
+
+
+#CREATE SYNAPSE USER
+if [ "$( sudo -i -u postgres psql -XtAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" )" = '1' ]
+    then
+        echo "User already exists"
+    else
+        echo "User does not exist"
+        
+        #Create User For Matrix Synapse Database
+        sudo -i -u postgres psql -c "CREATE USER $DB_USER WITH ENCRYPTED PASSWORD '$DB_USER_PASS';"
+fi
+
+#CREATE DATABASE
+if [ "$( sudo -i -u postgres psql -XtAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" )" = '1' ]
+    then
+        echo "Database already exists"
+    else
+        echo "Database does not exist"
+        
+        #Create Database For Matrix Synapse
+        sudo -i -u postgres psql -c "CREATE DATABASE "$DB_NAME" WITH OWNER "$DB_USER" ENCODING 'UTF8' LC_COLLATE = 'C' LC_CTYPE = 'C' TEMPLATE template0;"
+
+        #Grant Permissions
+        sudo -i -u postgres psql -c "grant all privileges on database $DB_NAME to $DB_USER;"
+fi
+
+
+#CREATE REPLICATOR USER
+if [ "$( sudo -i -u postgres psql -XtAc "SELECT 1 FROM pg_roles WHERE rolname='$REPLICATOR_USERNAME'" )" = '1' ]
+    then
+        echo "REPLICATOR_USERNAME already exists"
+    else
+        echo "REPLICATOR_USERNAME does not exist"
+        
+        #Create User For Database Replicator
+        sudo -i -u postgres psql -c "CREATE USER $REPLICATOR_USERNAME WITH REPLICATION ENCRYPTED PASSWORD '$REPLICATOR_PASS';"
+fi
+
+#CREATE SUPER USER
+if [ "$( sudo -i -u postgres psql -XtAc "SELECT 1 FROM pg_roles WHERE rolname='$SUPER_USERNAME'" )" = '1' ]
+    then
+        echo "SUPER_USERNAME already exists"
+    else
+        echo "SUPER_USERNAME does not exist"
+        
+        #Create Super User Patroni and Postgresql
+        sudo -i -u postgres psql -c "CREATE USER $SUPER_USERNAME WITH SUPERUSER ENCRYPTED PASSWORD '$SUPER_PASS';"
+fi

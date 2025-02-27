@@ -1,0 +1,317 @@
+
+scope: <%= node['rxsynapse_attributes']['patroni']['scope'] %>
+namespace: /service/
+name: <%= node['rxsynapse_attributes']['node_name'] %>
+
+restapi:
+    listen: 0.0.0.0:<%= node['rxsynapse_attributes']['patroni']['restapi_port'] %>
+    connect_address: <%= node['rxsynapse_attributes']['ipaddress'] %>:<%= node['rxsynapse_attributes']['patroni']['restapi_port'] %>
+
+etcd:
+    hosts: <%= @etcd_nodes_list.join(', ') %>
+
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+          wal_level: replica
+          hot_standby: "on"
+          wal_keep_segments: 10
+          max_wal_senders: 5
+          max_replication_slots: 10
+          wal_log_hints: "on"
+          logging_collector: 'on'
+
+
+  initdb:
+  - encoding: UTF8
+  - locale: C
+  - data-checksums
+
+  pg_hba:
+  - host replication <%=node['rxsynapse_attributes']['pgsql']['replicator_username']%> 127.0.0.1/32 trust
+  - host replication <%=node['rxsynapse_attributes']['pgsql']['replicator_username']%> 0.0.0.0/0 md5
+  <% node['rxsynapse_attributes']['servers'].each do |server| %>
+  - host all <%=node['rxsynapse_attributes']['pgsql']['replicator_username']%> <%= server['ipaddress'] %>/0 trust
+  <% end %>
+  - host all all 0.0.0.0/0 md5
+  - host all all ::0/0 md5
+
+  # Users which needs to be created after initializing new cluster
+  users:
+    admin:
+      password: admin
+      options:
+        - createrole
+        - createdb
+
+    <%=node['rxsynapse_attributes']['pgsql']['superuser_username']%>:
+      password: <%=node['rxsynapse_attributes']['pgsql']['superuser_password']%>
+      options:
+        - createrole
+        - createdb
+
+    <%=node['rxsynapse_attributes']['pgsql']['replicator_username']%>:
+      password: <%=node['rxsynapse_attributes']['pgsql']['replicator_password']%>
+      options:
+        - replication
+
+    rewind:
+      password: rewind
+      options:
+        - rewind
+
+postgresql:
+  cluster_name: <%= node['rxsynapse_attributes']['node_name'] %>
+  listen: 0.0.0.0:<%= node['rxsynapse_attributes']['pgsql']['connection_port'] %>
+  connect_address: <%= node['rxsynapse_attributes']['ipaddress'] %>:<%= node['rxsynapse_attributes']['pgsql']['connection_port'] %>
+  proxy_address: <%= node['rxsynapse_attributes']['ipaddress'] %>:<%= node['rxsynapse_attributes']['pgsql']['proxy_address'] %>
+  data_dir: <%= node['rxsynapse_attributes']['patroni']['data_dir'] %>
+  config_dir: <%= node['rxsynapse_attributes']['patroni']['config_dir'] %>
+  bin_dir: <%= node['rxsynapse_attributes']['patroni']['bin_dir'] %>
+  pgpass: /tmp/pgpass
+  
+  authentication:
+    replication:
+      username: <%= node['rxsynapse_attributes']['pgsql']['replicator_username'] %>
+      password: <%= node['rxsynapse_attributes']['pgsql']['replicator_password'] %>
+    superuser:
+      username: <%= node['rxsynapse_attributes']['pgsql']['superuser_username'] %>
+      password: <%= node['rxsynapse_attributes']['pgsql']['superuser_password'] %>
+    rewind:
+      username: rewind
+      password: rewind
+
+tags:
+    nofailover: false
+    noloadbalance: false
+    clonefrom: false
+    nosync: false
+
+
+
+
+
+
+<%# ------------------------------------------------------------------------------------------------------------------------------------------------------------------ %>
+
+scope: <%= node['rxsynapse_attributes']['pg_cluster_name'] %>
+namespace: /service/
+name: <%= node['rxsynapse_attributes']['node_name'] %>
+
+{% if patroni_log_destination == 'logfile' %}
+log:
+  level: {{ patroni_log_level |upper }}
+  traceback_level: {{ patroni_log_traceback_level |upper }}
+  format: {{ patroni_log_format |quote }}
+  dateformat: {{ patroni_log_dateformat |quote }}
+  max_queue_size: {{ patroni_log_max_queue_size |int }}
+  dir: {{ patroni_log_dir }}
+  file_num: {{ patroni_log_file_num |int }}
+  file_size: {{ patroni_log_file_size |int }}
+  loggers:
+    patroni.postmaster: {{ patroni_log_loggers_patroni_postmaster |upper }}
+    urllib3: {{ patroni_log_loggers_urllib3 |upper }}
+{% endif %}
+
+restapi:
+    listen: 0.0.0.0:<%= node['rxsynapse_attributes']['patroni']['restapi_port'] %>
+    connect_address: <%= node['rxsynapse_attributes']['ipaddress'] %>:<%= node['rxsynapse_attributes']['patroni']['restapi_port'] %>
+
+
+etcd3:
+    hosts: <%= @etcd_nodes_list.join(', ') %>
+
+
+
+
+bootstrap:
+  method: {{ patroni_cluster_bootstrap_method }}
+{% if patroni_cluster_bootstrap_method == 'wal-g' %}
+  wal-g:
+    command: {{ wal_g_patroni_cluster_bootstrap_command }}
+    no_params: True
+    recovery_conf:
+       recovery_target_action: promote
+       recovery_target_timeline: latest
+       restore_command: wal-g wal-fetch %f %p
+{% endif %}
+{% if patroni_cluster_bootstrap_method == 'pg_probackup' %}
+  pg_probackup:
+    command: {{ pg_probackup_patroni_cluster_bootstrap_command }}
+    no_params: true
+{% endif %}
+  dcs:
+    ttl: {{ patroni_ttl |d(30, true) |int }}
+    loop_wait: {{ patroni_loop_wait |d(10, true) |int }}
+    retry_timeout: {{ patroni_retry_timeout |d(10, true) |int }}
+    maximum_lag_on_failover: {{ patroni_maximum_lag_on_failover | d(1048576) | int }}
+    master_start_timeout: {{ patroni_master_start_timeout |d(300, true) |int }}
+    synchronous_mode: {{ synchronous_mode |string |d(false, true) |lower }}
+    synchronous_mode_strict: {{ synchronous_mode_strict |string |d(false, true) |lower }}
+    synchronous_node_count: {{ synchronous_node_count |d(1, true) |int }}
+    postgresql:
+      use_pg_rewind: {{ patroni_postgresql_use_pg_rewind |string |d(false, true) |lower }}
+      use_slots: true
+      parameters:
+      {% for parameter in postgresql_parameters %}
+        {{ parameter.option }}: "{{ parameter.value }}"
+      {% endfor %}
+    {% if patroni_standby_cluster.host is defined and patroni_standby_cluster.host | length > 0 %}
+    standby_cluster:
+      host: {{ patroni_standby_cluster.host }}
+      port: {{ patroni_standby_cluster.port }}
+      {% if patroni_standby_cluster.primary_slot_name is defined and patroni_standby_cluster.primary_slot_name | length > 0 %}
+      primary_slot_name: {{ patroni_standby_cluster.primary_slot_name }}
+      {% endif %}
+      {% if patroni_standby_cluster.restore_command is defined and patroni_standby_cluster.restore_command | length > 0 %}
+      restore_command: {{ patroni_standby_cluster.restore_command }}
+      {% endif %}
+      {% if patroni_standby_cluster.recovery_min_apply_delay is defined and patroni_standby_cluster.recovery_min_apply_delay | length > 0 %}
+      recovery_min_apply_delay: {{ patroni_standby_cluster.recovery_min_apply_delay }}
+     {% endif %}
+    {% endif %}
+    {% if patroni_slots is defined and patroni_slots | length > 0 %}
+    slots:
+      {% for slot in patroni_slots %}
+      {{ slot.slot }}:
+        type: {{ slot.type }}
+        {% if slot.plugin | default('') | length > 0 %}
+        plugin: {{ slot.plugin }}
+        {% endif %}
+        {% if slot.database | default('') | length > 0 %}
+        database: {{ slot.database }}
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+
+  initdb:  # List options to be passed on to initdb
+    - encoding: {{ postgresql_encoding }}
+    - locale: {{ postgresql_locale }}
+  {% if postgresql_data_checksums|bool %}
+    - data-checksums
+  {% endif %}
+
+  pg_hba:  # Add following lines to pg_hba.conf after running 'initdb'
+    - host replication {{ patroni_replication_username }} 127.0.0.1/32 {{ postgresql_password_encryption_algorithm }}
+    - host all all 0.0.0.0/0 {{ postgresql_password_encryption_algorithm }}
+
+
+postgresql:
+  listen: {{ postgresql_listen_addr }}:{{ postgresql_port }}
+  connect_address: {{ inventory_hostname }}:{{ postgresql_port }}
+{% if patroni_superuser_username == 'postgres' %}
+  use_unix_socket: true
+{% endif %}
+  data_dir: {{ postgresql_data_dir }}
+  bin_dir: {{ postgresql_bin_dir }}
+  config_dir: {{ postgresql_conf_dir }}
+  pgpass: {{ postgresql_home_dir }}/.pgpass_patroni
+  authentication:
+    replication:
+      username: {{ patroni_replication_username }}
+      password: {{ patroni_replication_password }}
+    superuser:
+      username: {{ patroni_superuser_username }}
+      password: {{ patroni_superuser_password }}
+#    rewind:  # Has no effect on postgres 10 and lower
+#      username: rewind_user
+#      password: rewind_password
+  parameters:
+    unix_socket_directories: {{ postgresql_unix_socket_dir }}
+{% if postgresql_stats_temp_directory_path is defined and postgresql_stats_temp_directory_path != 'none' and postgresql_version | int <= 14 %}
+    stats_temp_directory: {{ postgresql_stats_temp_directory_path }}
+{% endif %}
+
+{% if postgresql_pg_ident is defined and postgresql_pg_ident | length > 0 %}
+  pg_ident:
+  {% for ident in postgresql_pg_ident %}
+    - {{ ident.mapname }} {{ ident.system_username }} {{ ident.pg_username }}
+  {% endfor %}
+{% endif %}
+
+  remove_data_directory_on_rewind_failure: {{ patroni_remove_data_directory_on_rewind_failure |string |d(false, true) |lower }}
+  remove_data_directory_on_diverged_timelines: {{ patroni_remove_data_directory_on_diverged_timelines |string |d(false, true) |lower }}
+
+{% if patroni_callbacks is defined and patroni_callbacks | length > 0 %}
+  callbacks:
+  {% for callback in patroni_callbacks %}
+    {% if callback.script | length > 0 %}
+      {{ callback.action }}: '{{ callback.script }}'
+    {% endif %}
+  {% endfor %}
+{% endif %}
+
+  create_replica_methods:
+{% if patroni_create_replica_methods is defined and patroni_create_replica_methods | length > 0 %}
+  {% for create_replica_method in patroni_create_replica_methods %}
+    - {{ create_replica_method }}
+  {% endfor %}
+  {% if 'pgbackrest' in patroni_create_replica_methods %}
+  pgbackrest:
+    {% for item in pgbackrest %}
+    {{ item.option }}: {{ item.value }}
+    {% endfor %}
+  {% endif %}
+  {% if 'wal_g' in patroni_create_replica_methods %}
+  wal_g:
+    {% for item in wal_g %}
+    {{ item.option }}: {{ item.value }}
+    {% endfor %}
+  {% endif %}
+  {% if 'basebackup' in patroni_create_replica_methods %}
+  basebackup:
+    {% for item in basebackup %}
+    {{ item.option }}: '{{ item.value }}'
+    {% endfor %}
+  {% endif %}
+  {% if 'pg_probackup' in patroni_create_replica_methods %}
+  pg_probackup:
+    {% for item in pg_probackup %}
+    {{ item.option }}: {{ item.value }}
+    {% endfor %}
+  {% endif %}
+{% else %}
+    - basebackup
+  basebackup:
+    max-rate: '100M'
+{% endif %}
+
+{% if postgresql_restore_command is defined and postgresql_restore_command | length > 0 %}
+  recovery_conf:
+    restore_command: {{ postgresql_restore_command }}
+{% endif %}
+
+watchdog:
+  mode: {{ patroni_watchdog_mode if patroni_watchdog_mode in ['off', 'automatic', 'required'] else 'off'}}  # Allowed values: off, automatic, required
+  device: {{ patroni_watchdog_device }}  # Path to the watchdog device
+  safety_margin: 5
+
+tags:
+{% if patroni_tags is defined and patroni_tags | length > 0 %}
+  {{ patroni_tags | replace(" ", "") | replace("=", ": ") | replace(",", "\n  ") }}
+{% endif %}
+{% set normalized_tags = patroni_tags | default('') | replace(" ", "") %}
+{% if 'nosync=' not in normalized_tags %}
+  nosync: false
+{% endif %}
+{% if 'noloadbalance=' not in normalized_tags %}
+  noloadbalance: false
+{% endif %}
+{% if 'nofailover=' not in normalized_tags %}
+  nofailover: false
+{% endif %}
+{% if 'clonefrom=' not in normalized_tags %}
+  clonefrom: false
+{% endif %}
+
+  # specify a node to replicate from (cascading replication)
+#  replicatefrom: (node name)
+

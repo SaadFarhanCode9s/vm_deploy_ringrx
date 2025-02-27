@@ -1,0 +1,75 @@
+global
+    maxconn 100000
+    log /dev/log    local0
+    log /dev/log    local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    mode               tcp
+    log                global
+    option             tcplog
+    retries            2
+    timeout queue      5s
+    timeout connect    5s
+    timeout client     60m
+    timeout server     60m
+    timeout check      15s
+
+listen stats
+    mode http
+    bind <%=node['rxsynapse_attributes']['ipaddress']%>:<%=node['rxsynapse_attributes']['haproxy_attr']['stats_port']%>
+    stats enable
+    stats uri /
+
+listen master
+    bind <%=node['rxsynapse_attributes']['ipaddress']%>:<%=node['rxsynapse_attributes']['haproxy_attr']['pgsql_master']%>
+    maxconn 10000
+    option httpchk OPTIONS /primary
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 4 on-marked-down shutdown-sessions
+    <% node['rxsynapse_attributes']['servers'].each do |server| %>
+    server <%= server['node_name']%> <%= server['ipaddress'] %>:<%= node['rxsynapse_attributes']['pgsql']['proxy_address'] %> check port <%= node['rxsynapse_attributes']['patroni']['restapi_port'] %> 
+    <% end %>
+
+
+listen replicas
+    bind <%=node['rxsynapse_attributes']['ipaddress']%>:<%=node['rxsynapse_attributes']['haproxy_attr']['pgsql_replicas']%>
+    maxconn 10000
+    option httpchk OPTIONS /replica?lag=100MB
+    balance roundrobin
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    <% node['rxsynapse_attributes']['servers'].each do |server| %>
+    server <%= server['node_name']%> <%= server['ipaddress'] %>:<%= node['rxsynapse_attributes']['pgsql']['proxy_address'] %> check port <%= node['rxsynapse_attributes']['patroni']['restapi_port'] %> 
+    <% end %>
+
+
+listen replicas_sync
+    bind <%=node['rxsynapse_attributes']['ipaddress']%>:<%=node['rxsynapse_attributes']['haproxy_attr']['pgsql_replicas_sync']%>
+    maxconn 10000
+    option httpchk OPTIONS /sync
+    balance roundrobin
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    <% node['rxsynapse_attributes']['servers'].each do |server| %>
+    server <%= server['node_name']%> <%= server['ipaddress'] %>:<%= node['rxsynapse_attributes']['pgsql']['proxy_address'] %> check port <%= node['rxsynapse_attributes']['patroni']['restapi_port'] %> 
+    <% end %>
+
+
+listen replicas_async
+    bind <%=node['rxsynapse_attributes']['ipaddress']%>:<%=node['rxsynapse_attributes']['haproxy_attr']['pgsql_replicas_async']%>
+    maxconn 10000
+    option httpchk OPTIONS /async?lag=100MB
+    balance roundrobin
+    http-check expect status 200
+    default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    <% node['rxsynapse_attributes']['servers'].each do |server| %>
+    server <%= server['node_name']%> <%= server['ipaddress'] %>:<%= node['rxsynapse_attributes']['pgsql']['proxy_address'] %> check port <%= node['rxsynapse_attributes']['patroni']['restapi_port'] %> 
+    <% end %>
+
+

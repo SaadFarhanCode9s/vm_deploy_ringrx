@@ -1,0 +1,14 @@
+127.0.0.1       localhost
+127.0.1.1       <% node['rxsynapse_attributes']['node_fqdn'] %>     <% node['rxsynapse_attributes']['node_name'] %> 
+<% node['rxsynapse_attributes']['ipaddress'] %>       <% node['rxsynapse_attributes']['node_fqdn'] %>     <% node['rxsynapse_attributes']['node_name'] %> 
+
+# The following lines are desirable for IPv6 capable hosts
+::1     localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+
+
+
+<% node['rxsynapse_attributes']['servers'].each do |server| %>
+<%= server['ipaddress'] %> <%= server['fqdn'] %> <%= server['node_name'] %>
+<% end %>

@@ -1,0 +1,598 @@
+import re
+import requests
+import json
+import attr
+import logging
+import string
+import time
+
+from typing import  Any, Dict, Awaitable, Callable, Optional, Tuple
+from typing_extensions import Final
+
+# from synapse.server import HomeServer
+from synapse.module_api import JsonDict, ModuleApi
+from synapse.module_api.errors import ConfigError, SynapseError
+
+from twisted.internet import reactor, defer
+from twisted.web.client import Agent
+from twisted.web.resource import Resource
+from twisted.web.server import Request, NOT_DONE_YET
+
+from synapse.storage.database import (
+    DatabasePool,
+    LoggingTransaction,
+)
+
+
+
+#localpart characters
+mxid_localpart_allowed_characters = frozenset(
+    "_-./=" + string.ascii_lowercase + string.digits
+)
+
+logger = logging.getLogger(__name__)
+
+#The admin access token obtained via Admin login API
+admin_access_token = None
+
+
+agent = Agent(reactor)
+
+@attr.s(auto_attribs=True)
+class AuthCallbackConfig:
+    enabled: bool
+    admin_username: str
+    admin_password: str
+    synapse_server_baseurl: str
+    engine_auth_url: str
+    engine_fetch_rooms_url: str
+    synapse_admin_login_api_internal: str
+    register_user_admin_api_internal: str
+    deactivate_user_admin_api_internal: str
+
+
+class LoginType:
+    EMAIL_IDENTITY: Final = "m.login.email.identity" 
+    
+
+# This class has methods specifically for APIs that could be useful for Engine to consume
+class EngineUserOperations(Resource):
+    isLeaf = True
+
+    def __init__(self, api: ModuleApi, config: AuthCallbackConfig):
+        # super(EngineUserOperations, self).__init__()
+        self.api = api
+        self.config = config
+
+    async def disable_user(self, request):
+        
+        try:            
+            request_payload = json.loads(request.content.read().decode("utf-8"))
+            
+            email = request_payload.get("email")
+
+            if not email:
+                request.setResponseCode(400)
+                request.write(json.dumps({"error": "expecting a json body with email address"}).encode("utf-8"))
+                request.finish()
+                
+            res = await CheckAuthCallback.deactivate_user_account(email)               
+            
+            
+            request.setResponseCode(200)
+            request.write(json.dumps({"response": str(res)}).encode("utf-8"))
+            request.finish()
+            
+            
+            return
+            
+        except Exception as e:     
+            self.errorHandler(e)    
+    
+    
+    def errorHandler(self, failure):
+        self.req.setResponseCode(400)
+        self.req.write(json.dumps({"error": str(failure.value)}).encode("utf-8"))
+        self.req.finish()
+
+    def render_POST(self, request: Request):
+        self.req = request
+        request.setHeader(b"Content-Type", b"application/json")
+
+        d = defer.ensureDeferred(self.disable_user(request))
+        d.addErrback(self.errorHandler)
+
+        return NOT_DONE_YET
+
+    
+class CheckAuthCallback:
+    def __init__(self, config: AuthCallbackConfig, api: ModuleApi) :
+        self.api = api
+        self.config = config
+        
+        #Register synapse web recource
+        self.api.register_web_resource(
+            path="/_synapse/client/ringrx/disable_user",
+            resource=EngineUserOperations(self.api, self.config)
+        )
+        
+        #Register auth callback
+        self.api.register_password_auth_provider_callbacks(
+            check_3pid_auth=self.check_3pid_auth_type # For validating 3PID auth (Email/Phone)
+        )
+
+
+    @staticmethod
+    def parse_config(config: Dict[str, Any]) -> AuthCallbackConfig:
+        def check_in_config(param: str):
+            if param not in config:
+                raise ConfigError(f"'{param}' is required")
+
+        check_in_config("enabled")
+        check_in_config("admin_username")
+        check_in_config("admin_password")
+        check_in_config("synapse_server_baseurl")
+        check_in_config("engine_auth_url")
+        check_in_config("engine_fetch_rooms_url")
+        check_in_config("synapse_admin_login_api_internal")
+        check_in_config("register_user_admin_api_internal")
+        check_in_config("deactivate_user_admin_api_internal")
+
+        return AuthCallbackConfig(
+            enabled=config["enabled"],            
+            admin_username = config["admin_username"],
+            admin_password = config["admin_password"],
+            synapse_server_baseurl = config["synapse_server_baseurl"],
+            engine_auth_url=config["engine_auth_url"],
+            engine_fetch_rooms_url = config["engine_fetch_rooms_url"],
+            register_user_admin_api_internal = config["register_user_admin_api_internal"],
+            synapse_admin_login_api_internal = config["synapse_admin_login_api_internal"],
+            deactivate_user_admin_api_internal = config["deactivate_user_admin_api_internal"]
+        )
+
+
+    # Callback for Validating 3PID Authentication Types -  Email or Phone Login
+    async def check_3pid_auth_type(
+        self, medium: str, address: str, password: str
+    ) -> Optional[str]:
+        """Check if a password provider is able to validate a thirdparty login
+
+        Args:
+            medium: The medium of the 3pid (ex. email).
+            address: The address of the 3pid (ex. jdoe@example.com).
+            password: The password of the user.
+
+        Returns:
+            A tuple of `(user_id, callback)`. If authentication is successful,
+            `user_id`is the authenticated, canonical user ID. `callback` is
+            then either a function to be later run after the server has
+            completed login/registration, or `None`. If authentication was
+            unsuccessful, `user_id` and `callback` are both `None`.
+        """
+        
+        # We currently only support email
+        if medium != "email":
+            return None
+        
+        # Check and populate admin access token    
+        if admin_access_token is not None:
+            access_token = admin_access_token
+            
+        else:
+            #Obtain admin access token via login API
+            access_token  = await self.admin_login()
+        
+            
+        try:
+            if address and password and access_token:
+                
+                #Check user credetials on Core Engine First
+                engine_reponse = await self.engine_auth_api(address, password)
+                
+                #Check user existance on synapse server
+                registered_user_id = await self.get_user_id_by_threepid(medium, address)
+                
+                if engine_reponse == True:    
+                    if registered_user_id is None:
+                        
+                        # Means there is no associated user with this email address.
+                        # Thus, we will register this user.
+                        # First step is to filter the address to matrix acceptable user id
+                        
+                        # Eliminate email provider
+                        re_address = address.split("@")[0]                    
+                        
+                        # Filter out invalid characters
+                        filtered = filter(
+                            lambda c: c in mxid_localpart_allowed_characters,
+                            re_address.replace("@", "-").lower(),
+                        )
+                        desired_username = "".join(filtered)
+
+                        # Generate a unique username by appending "xx" to the desired value if it
+                        # clashes with an existing username, where "xx" is the first integer that
+                        # doesn't create a clash.
+                        final_username = await self._generate_unique_username(
+                            r"^(.*?)(\d+)$",
+                            desired_username)                        
+                        
+                        if final_username:
+                                                        
+                            #Now utilizing admin API for registering users
+                            registered_user_id = await self.register_user_admin_api(access_token, final_username, address, password)
+                            
+                            if registered_user_id:
+                                return True
+                            else:
+                                return False                           
+
+                        else:
+                            return False      
+                    else:
+                        return True    
+                    
+                #Engine reponse not true    
+                else:
+                    # In this case, we will disable the user if already exists on synapse 
+                    if registered_user_id is not None :
+                        await self.deactivate_user_account(registered_user_id)
+                        
+                    return None    
+                
+            #Not address OR password
+            else:   
+                return None
+            
+                   
+        except Exception as e:
+            print("Error Processing check_pass", e)       
+    
+       
+    async def engine_auth_api(
+        self,
+        username: str,
+        password: str
+        ):
+        try:           
+            headers = {
+                'content-type': 'application/json'
+            }        
+            payload = {"username":username, "password":password}
+            uri = self.config.engine_auth_url
+            
+            url = uri+'?username='+username+'&password='+ password
+            
+            engine_login_event_content = await self.api.http_client.post_json_get_json(
+                    uri=url,
+                    post_json=payload,
+                    headers=headers
+                    )
+            
+            try:
+                
+                if engine_login_event_content["access_token"] and engine_login_event_content["access_token"] is not None :
+                    return True                
+                else:
+                    return False
+            
+            except Exception as e:
+                print(e)  
+                
+                
+            #By default return false
+            return False
+            
+            
+        except Exception as e:
+            print("Error authorizing data from Engine API ", e)  
+            return False
+        
+
+
+#
+# Function to validate and return the user ID by the provided Email address
+# 
+       
+    async def get_user_id_by_threepid(self, medium: str, address: str) -> Optional[str]:
+        """Returns user id from threepid
+
+        Args:
+            medium: threepid medium e.g. email
+            address: threepid address e.g. me@example.com. This must already be
+                in canonical form.
+
+        Returns:
+            The user ID or None if no user id/threepid mapping exists
+        """
+
+        user_id = await self.api.run_db_interaction(
+            "get_user_id_by_threepid", self.get_user_id_by_threepid_txn, medium, address
+        )
+
+        return user_id
+
+    def get_user_id_by_threepid_txn(
+        self, txn: LoggingTransaction, medium: str, address: str
+    ) -> Optional[str]:
+        """Returns user id from threepid
+
+        Args:
+            txn:
+            medium: threepid medium e.g. email
+            address: threepid address e.g. me@example.com
+
+        Returns:
+            user id, or None if no user id/threepid mapping exists
+        """
+        ret = DatabasePool.simple_select_one_txn(
+            txn,
+            "user_threepids",
+            {"medium": medium, "address": address},
+            ["user_id"],
+            True,
+        )
+        if ret:
+            return ret["user_id"]
+        return None
+    
+
+#
+# Function to generate and validate username for Matrix Synapse
+#  
+      
+    async def _generate_unique_username(
+        self,
+        r: str,
+        desired_username: str,
+        separator: str = "",
+    ) -> str:
+        """Generates a unique username based on the given value extracted by the module,
+        appending an integer to it if it clashes with an existing username.
+
+        Args:
+            r: The pattern to use to identify whether we've already started appending
+                integers to the desired value.
+            desired_username: The initial value to check for existence and derive if
+                needed.
+            separator: The separator between the desired username and the integer.
+
+        Returns:
+            A unique username based on the initial value.
+        """
+        while True:
+            try:
+                await self.api.check_username(desired_username)
+                # if we got this far we passed the check.
+                break
+            except SynapseError as e:
+                if e.errcode == "M_USER_IN_USE":
+                    m = re.match(r, desired_username)
+                    if m:
+                        desired_username = m.group(1) + str(int(m.group(2)) + 1)
+                    else:
+                        desired_username += separator + "1"
+                else:
+                    # something else went wrong.
+                    raise
+
+        return desired_username
+    
+
+
+#    
+# Synapse Admin Login 
+#
+  
+    async def admin_login(
+        self
+        ):
+        try:
+            uri = self.config.synapse_admin_login_api_internal
+            username = self.config.admin_username
+            password = self.config.admin_password
+            
+            if uri and username and password:
+                                  
+                headers = {
+                    'content-type': 'application/json'
+                }        
+
+                payload =  {
+                    "password": password,
+                    "identifier":{"type":"m.id.user","user":username},
+                    "type":"m.login.password"
+                }
+
+                admin_login_event_content = await self.api.http_client.post_json_get_json(
+                    uri=uri,
+                    post_json=payload,
+                    headers=headers,
+                )                
+                
+                if admin_login_event_content and admin_login_event_content.get("access_token"):      
+                                 
+                    access_token_ = admin_login_event_content.get("access_token")
+                        
+                    #Update admin access token
+                    global admin_access_token 
+                    admin_access_token = access_token_
+                        
+                    # return login_event_content
+                    return access_token_
+                else:
+                    return False
+            else:
+                return False
+                        
+        except Exception as e:  
+            return None   
+        
+        
+ 
+ 
+ 
+#    
+# Synapse Admin API User Registration endpoint  
+#
+  
+    async def register_user_admin_api(
+        self,
+        token: str,
+        username: str,
+        address: str,
+        password: str
+        ):
+        try:                   
+            if self.config.register_user_admin_api_internal and token and username and address and password:
+                
+                headers = {b"Authorization": [b"Bearer " + str(token).encode('ascii')]}
+
+                
+                payload = {
+                    "password": password,
+                    "displayname": username,
+                    "threepids": [
+                        {
+                            "medium": "email",
+                            "address": address
+                        }
+                    ],
+                    "admin": False,
+                    "deactivated": False
+                }
+                
+                matrix_user_id = self.api.get_qualified_user_id(username)
+                
+                if matrix_user_id:                    
+                        
+                    uri = self.config.register_user_admin_api_internal +'/'+ matrix_user_id 
+                    
+                    await self.api.http_client.put_json(
+                        uri=uri,
+                        json_body=payload,
+                        headers=headers
+                        )
+
+                    # return user_register_event
+                    return matrix_user_id #Return user_id if the registeration is successful
+                
+                else:
+                    #Unable to obtain matrix qualified user id
+                    return False
+            
+            else:
+                return False    
+                        
+        except Exception as e:   
+            return e   
+        
+         
+        
+       
+#
+# Deactivate User Account - Admin API
+#        
+    async def deactivate_user_account(
+        self,
+        user_id: str # Matrix qualified user ID
+        ):
+        try:  
+            global admin_access_token        
+            
+            #Ensure admin token exists             
+            if admin_access_token is None:
+                await self.admin_login()
+                
+            if admin_access_token and self.config.deactivate_user_admin_api_internal and user_id:    
+            
+                headers = {b"Authorization": [b"Bearer " + str(admin_access_token).encode('ascii')]}                        
+                uri = self.config.deactivate_user_admin_api_internal + "/" + user_id                
+                payload =  {
+                    "erase": False
+                }
+                
+                disable_user_event = await self.api.http_client.post_json_get_json(
+                    uri=uri,
+                    post_json=payload,
+                    headers=headers
+                    )
+                
+                return disable_user_event
+            else:
+                return False
+                        
+        except Exception as e:    
+            return e   
+        
+        
+        
+        
+
+#Method to pull joinable rooms from Engine
+
+    async def engine_joinable_rooms(
+        self,
+        address,
+        userId        
+    ):        
+        try:
+            if self.config.engine_fetch_rooms_url and userId and address:   
+                # Fetching Server Name                               
+                servername = self.api.server_name                    
+                uri = self.config.engine_fetch_rooms_url+"?username="+address                
+                rooms_to_join = await self.api.http_client.get_json(uri)  
+                
+                if rooms_to_join['rooms_to_join'] and len(rooms_to_join['rooms_to_join']) > 0:  
+                    
+                    room_list = rooms_to_join['rooms_to_join']
+                                    
+                    for r in room_list:
+                        room_address = "#"+r+":"+servername                        
+                        await self.update_room_membership('@admin:matrix.localhost', userId, room_address)
+                        time.sleep(0.4)
+                            
+                else:
+                    return False
+                          
+                return rooms_to_join
+            else:
+                return False
+                        
+        except Exception as e:     
+            return e   
+        
+        
+        
+    
+    
+    
+    
+    
+    #Method to update user's membership in a specific room    
+    async def update_room_membership (
+        self,
+        senderId: str,
+        targetId: str,
+        roomId: str
+    ):
+        if not senderId or not targetId or not roomId:
+            print("Parameters missing for update_room_membership")
+        else:
+            #in case of room alias, we will add an additional api call to pull room id based on provided room alias .
+            #e.g. ('!pLYmjxMKzpfucoxKXF:matrix.localhost', ['matrix.localhost'])
+            room_id_tuple = await self.api.lookup_room_alias(roomId)
+            
+            if room_id_tuple:
+                room_id = room_id_tuple[0]
+            
+                #wrapping the following API methods in try catch to handle 'Already in room' error
+                try:
+                    #Proceed to user invitation and joining the room.
+                    await self.api.update_room_membership(senderId, targetId, room_id, 'invite')
+                    time.sleep(0.4)
+                    await self.api.update_room_membership(targetId, targetId, room_id, 'join')
+                
+                except Exception as e:
+                    print("Error adding user to provided room ", e)        
+            else:
+                print("ROOM IDs NOT AVAILABLE, THUS NOT JOINING ANY ROOM")
