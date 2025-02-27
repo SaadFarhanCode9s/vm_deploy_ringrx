@@ -31,5 +31,5 @@ echo "Cleaning up chef artifacts for clean run"
 rm -rf ./local-mode-cache
 rm -rf ../nodes
 
-cd /root/ringrx_cookbook_deb && chef-solo --force-logger -c solo.rb
+cd /root/vm_deploy_ringrx/ && chef-solo --force-logger -c solo.rb
 
